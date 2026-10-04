@@ -2,21 +2,21 @@ import z from '@deepseek-ai/schemastery'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import { assertUsableApiKey, attributionHeaders } from '@deepseek-ai/dsh-llm'
 import { Config as PiAiConfig } from '@deepseek-ai/dsh-llm-pi-ai'
-import { deepEqualJson, settingsNamespace } from '@deepseek-ai/dsh-settings'
+import { deepEqualJson } from '@deepseek-ai/dsh-util-values'
 import { catalogURL, readCodexCatalog } from './catalog.js'
 
 const MAX_CATALOG_BYTES = 4 * 1024 * 1024
-const DISCOVERY_HANDOFF_TTL_MS = 60000
+const DISCOVERY_HANDOFF_TTL_MS = 60_000
 const MAX_DISCOVERY_HANDOFFS = 8
-const DISCOVERY_NS = settingsNamespace('llm-cliproxyapi')
-const PI_NS = settingsNamespace('llm-pi-ai')
+const DISCOVERY_NS = 'llm-cliproxyapi'
+const PI_NS = 'llm-pi-ai'
 const API_KEY_REF = credentialRef('DSH_CLIPROXY_API_KEY')
 const PROVIDER = 'CLIProxyAPI'
 
 export const PROFILE_SYNC_HEADER = 'x-dsh-provider-cpa-sync'
 export const PLACEHOLDER_AUTHORIZATION = 'Bearer dsh-cliproxyapi-no-key'
 
-export const name = 'llm-cliproxyapi'
+export const name = DISCOVERY_NS
 export const inject = ['settings', 'credentials', 'llm', 'timer']
 
 export const Config = z.object({
@@ -81,7 +81,6 @@ function catalogHeadersOf(profileHeaders, configuredHeaders) {
 
 function profileHeadersOf(profileHeaders, configuredHeaders, hasApiKey) {
   const headers = mergedHeadersOf(profileHeaders, configuredHeaders)
-
   const authorization = headerKey(headers, 'authorization')
   if (hasApiKey) {
     if (authorization !== undefined && headers[authorization] === PLACEHOLDER_AUTHORIZATION) {
@@ -98,7 +97,7 @@ async function optionalApiKey(ctx, supplied) {
     ? (await ctx.credentials.resolve(API_KEY_REF))?.value
     : supplied
   if (raw === undefined || raw.length === 0) return undefined
-  return assertUsableApiKey(raw, 'llm-cliproxyapi', API_KEY_REF)
+  return assertUsableApiKey(raw, DISCOVERY_NS, API_KEY_REF)
 }
 
 function timedSignal(parent, timeoutMs) {
@@ -231,11 +230,9 @@ async function profileOf(profile, models, hasApiKey, config) {
     headers: profileHeadersOf(profile.headers, config.headers, hasApiKey),
     ...(hasApiKey ? { apiKeyEnv: API_KEY_REF } : {}),
   }
-  const validated = await PiAiConfig['~standard'].validate({ providers: { [PROVIDER]: candidate } })
-  if (validated.issues?.length) {
-    throw new Error(`llm-pi-ai rejected the generated provider profile: ${validated.issues[0].message}`)
-  }
-  return validated.value.providers[PROVIDER]
+  // providers is volatile in DSH 0.2: the Standard Schema view omits it.
+  // The callable schema validates the entry and keeps its resolved value.
+  return PiAiConfig({ providers: { [PROVIDER]: candidate } }).providers.get()[PROVIDER]
 }
 
 function retryDelay(config, failures) {
@@ -243,17 +240,29 @@ function retryDelay(config, failures) {
 }
 
 export function apply(ctx, config) {
-  if (!config.defaultInput.length) throw new Error('defaultInput must contain at least one modality')
-  if (config.retryMaxMs < config.retryInitialMs) throw new Error('retryMaxMs must be greater than or equal to retryInitialMs')
+  const validateConfig = (value) => {
+    if (!value.defaultInput.length) throw new Error('defaultInput must contain at least one modality')
+    if (value.retryMaxMs < value.retryInitialMs) {
+      throw new Error('retryMaxMs must be greater than or equal to retryInitialMs')
+    }
+  }
+  validateConfig(config)
+  let source = () => config
+  const currentConfig = () => source()
 
-  const catalogFor = (profile, signal) => discoverCatalog(ctx, {
+  const catalogFor = (profile, signal, activeConfig) => discoverCatalog(ctx, {
     baseURL: profile.baseURL,
-    defaultContextWindow: config.defaultContextWindow,
-    defaultMaxTokens: config.defaultMaxTokens,
-    defaultInput: config.defaultInput,
-    headers: catalogHeadersOf(profile.headers, config.headers),
-    fetchTimeoutMs: config.fetchTimeoutMs,
+    defaultContextWindow: activeConfig.defaultContextWindow,
+    defaultMaxTokens: activeConfig.defaultMaxTokens,
+    defaultInput: activeConfig.defaultInput,
+    headers: catalogHeadersOf(profile.headers, activeConfig.headers),
+    fetchTimeoutMs: activeConfig.fetchTimeoutMs,
   }, undefined, signal)
+
+  // DSH 0.2 stores pi-ai providers in the loader entry's volatile form,
+  // exposed by settings.describe(), rather than a settings.get() section.
+  const currentProfile = () => ctx.settings.describe()
+    .find((entry) => entry.ns === PI_NS)?.value?.providers?.[PROVIDER]
 
   const discoveryHandoffs = new Map()
 
@@ -279,15 +288,16 @@ export function apply(ctx, config) {
     return handoff.models
   }
 
-  ctx.llm.registerModelDiscovery(DISCOVERY_NS, async (request) => {
+  ctx.llm.registerModelDiscovery(DISCOVERY_NS, async (request, signal) => {
+    const activeConfig = currentConfig()
     const catalog = await discoverCatalog(ctx, {
       baseURL: request.baseURL,
-      defaultContextWindow: config.defaultContextWindow,
-      defaultMaxTokens: config.defaultMaxTokens,
-      defaultInput: config.defaultInput,
-      headers: config.headers,
-      fetchTimeoutMs: config.fetchTimeoutMs,
-    }, request.apiKey, request.signal)
+      defaultContextWindow: activeConfig.defaultContextWindow,
+      defaultMaxTokens: activeConfig.defaultMaxTokens,
+      defaultInput: activeConfig.defaultInput,
+      headers: activeConfig.headers,
+      fetchTimeoutMs: activeConfig.fetchTimeoutMs,
+    }, request.apiKey, signal ?? request.signal)
     rememberDiscovery(request.baseURL, catalog.models)
     return catalog.models
   })
@@ -295,9 +305,8 @@ export function apply(ctx, config) {
   let observedRefreshKey
 
   const synchronize = async (signal, authOnly = false) => {
-    const section = ctx.settings.get(PI_NS)
-    if (section === undefined) throw new Error('The built-in llm-pi-ai settings namespace is not ready')
-    const profile = section.providers?.[PROVIDER]
+    const activeConfig = currentConfig()
+    const profile = currentProfile()
     if (!profile) return false
     if (authOnly && profileSynchronizationPending(profile)) return true
     if (signal.aborted) throw signal.reason
@@ -309,14 +318,14 @@ export function apply(ctx, config) {
       const discovered = takeDiscovery(profile.baseURL)
       catalog = discovered
         ? { models: discovered, hasApiKey: await hasApiKey() }
-        : await catalogFor(profile, signal)
+        : await catalogFor(profile, signal, activeConfig)
     } else {
-      catalog = await catalogFor(profile, signal)
+      catalog = await catalogFor(profile, signal, activeConfig)
     }
     if (signal.aborted) throw signal.reason
-    const next = await profileOf(profile, catalog.models, catalog.hasApiKey, config)
+    const next = await profileOf(profile, catalog.models, catalog.hasApiKey, activeConfig)
     if (!deepEqualJson(next, profile)) {
-      observedRefreshKey = refreshKeyOf(next, config)
+      observedRefreshKey = refreshKeyOf(next, activeConfig)
       await ctx.settings.mutate(PI_NS, [{
         op: 'set',
         path: ['providers', PROVIDER],
@@ -365,7 +374,7 @@ export function apply(ctx, config) {
           failures = 0
           lastError = ''
           if (authOnly) rerun = true
-          else if (hasProfile && !rerun) wakeAfter(config.refreshIntervalMs)
+          else if (hasProfile && !rerun) wakeAfter(currentConfig().refreshIntervalMs)
         } catch (error) {
           if (controller.signal.aborted || stopped) continue
           failures += 1
@@ -374,7 +383,7 @@ export function apply(ctx, config) {
             ctx.logger.warn('CLIProxyAPI provider refresh failed: ' + message)
             lastError = message
           }
-          wakeAfter(retryDelay(config, failures))
+          wakeAfter(retryDelay(currentConfig(), failures))
           break
         } finally {
           if (activeController === controller) activeController = undefined
@@ -396,14 +405,14 @@ export function apply(ctx, config) {
   }
 
   const scheduleFromSettings = (force = false) => {
-    const profile = ctx.settings.get(PI_NS)?.providers?.[PROVIDER]
-    const refreshKey = refreshKeyOf(profile, config)
+    const profile = currentProfile()
+    const refreshKey = refreshKeyOf(profile, currentConfig())
     if (!force && refreshKey === observedRefreshKey) return
     observedRefreshKey = refreshKey
     schedule()
   }
 
-  ctx.on('settings/updated', (ns) => {
+  ctx.on('settings/document-updated', (ns) => {
     if (ns === PI_NS) scheduleFromSettings()
   })
   ctx.on('credentials/reference-updated', (ref) => {
